@@ -1,6 +1,8 @@
 import type { EmbeddingService } from './EmbeddingService.js';
 import { DefaultEmbeddingService } from './DefaultEmbeddingService.js';
 import { OpenAIEmbeddingService } from './OpenAIEmbeddingService.js';
+import { OllamaEmbeddingService } from './OllamaEmbeddingService.js';
+import { OpenRouterEmbeddingService } from './OpenRouterEmbeddingService.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -11,6 +13,10 @@ export interface EmbeddingServiceConfig {
   model?: string;
   dimensions?: number;
   apiKey?: string;
+  baseUrl?: string;
+  timeout?: number;
+  siteUrl?: string;
+  siteName?: string;
   [key: string]: unknown;
 }
 
@@ -94,6 +100,14 @@ export class EmbeddingServiceFactory {
   /**
    * Create an embedding service from environment variables
    *
+   * Priority order:
+   * 1. MOCK_EMBEDDINGS=true -> DefaultEmbeddingService
+   * 2. EMBEDDING_PROVIDER env var -> specified provider
+   * 3. OLLAMA_BASE_URL -> OllamaEmbeddingService
+   * 4. OPENROUTER_API_KEY -> OpenRouterEmbeddingService
+   * 5. OPENAI_API_KEY -> OpenAIEmbeddingService
+   * 6. Default -> DefaultEmbeddingService
+   *
    * @returns An embedding service implementation
    */
   static createFromEnvironment(): EmbeddingService {
@@ -102,8 +116,10 @@ export class EmbeddingServiceFactory {
 
     logger.debug('EmbeddingServiceFactory: Creating service from environment variables', {
       mockEmbeddings: useMockEmbeddings,
+      embeddingProvider: process.env.EMBEDDING_PROVIDER || 'auto',
+      ollamaUrlPresent: !!process.env.OLLAMA_BASE_URL,
+      openrouterKeyPresent: !!process.env.OPENROUTER_API_KEY,
       openaiKeyPresent: !!process.env.OPENAI_API_KEY,
-      embeddingModel: process.env.OPENAI_EMBEDDING_MODEL || 'default',
     });
 
     if (useMockEmbeddings) {
@@ -111,6 +127,60 @@ export class EmbeddingServiceFactory {
       return new DefaultEmbeddingService();
     }
 
+    // Check for explicit provider selection
+    const explicitProvider = process.env.EMBEDDING_PROVIDER?.toLowerCase();
+    if (explicitProvider) {
+      return EmbeddingServiceFactory._createExplicitProvider(explicitProvider);
+    }
+
+    // Auto-detect based on available environment variables
+
+    // 1. Check for Ollama (local/self-hosted, no API key needed)
+    const ollamaBaseUrl = process.env.OLLAMA_BASE_URL;
+    if (ollamaBaseUrl) {
+      try {
+        logger.debug('EmbeddingServiceFactory: Creating Ollama embedding service', {
+          baseUrl: ollamaBaseUrl,
+          model: process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text',
+        });
+        const service = new OllamaEmbeddingService({
+          baseUrl: ollamaBaseUrl,
+          model: process.env.OLLAMA_EMBEDDING_MODEL,
+        });
+        logger.info('EmbeddingServiceFactory: Ollama embedding service created successfully', {
+          model: service.getModelInfo().name,
+          dimensions: service.getModelInfo().dimensions,
+        });
+        return service;
+      } catch (error) {
+        logger.error('EmbeddingServiceFactory: Failed to create Ollama service', error);
+        // Continue to next provider
+      }
+    }
+
+    // 2. Check for OpenRouter
+    const openrouterApiKey = process.env.OPENROUTER_API_KEY;
+    if (openrouterApiKey) {
+      try {
+        logger.debug('EmbeddingServiceFactory: Creating OpenRouter embedding service', {
+          model: process.env.OPENROUTER_EMBEDDING_MODEL || 'openai/text-embedding-3-small',
+        });
+        const service = new OpenRouterEmbeddingService({
+          apiKey: openrouterApiKey,
+          model: process.env.OPENROUTER_EMBEDDING_MODEL,
+        });
+        logger.info('EmbeddingServiceFactory: OpenRouter embedding service created successfully', {
+          model: service.getModelInfo().name,
+          dimensions: service.getModelInfo().dimensions,
+        });
+        return service;
+      } catch (error) {
+        logger.error('EmbeddingServiceFactory: Failed to create OpenRouter service', error);
+        // Continue to next provider
+      }
+    }
+
+    // 3. Check for OpenAI
     const openaiApiKey = process.env.OPENAI_API_KEY;
     const embeddingModel = process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small';
 
@@ -136,11 +206,48 @@ export class EmbeddingServiceFactory {
       }
     }
 
-    // No OpenAI API key, using default embedding service
+    // No provider configured, using default embedding service
     logger.info(
-      'EmbeddingServiceFactory: No OpenAI API key found, using default embedding service'
+      'EmbeddingServiceFactory: No embedding provider configured, using default embedding service'
     );
     return new DefaultEmbeddingService();
+  }
+
+  /**
+   * Create a service based on explicit provider name
+   *
+   * @private
+   * @param provider - Provider name
+   * @returns Embedding service
+   */
+  private static _createExplicitProvider(provider: string): EmbeddingService {
+    switch (provider) {
+      case 'ollama':
+        return new OllamaEmbeddingService({
+          baseUrl: process.env.OLLAMA_BASE_URL,
+          model: process.env.OLLAMA_EMBEDDING_MODEL,
+        });
+
+      case 'openrouter':
+        return new OpenRouterEmbeddingService({
+          apiKey: process.env.OPENROUTER_API_KEY,
+          model: process.env.OPENROUTER_EMBEDDING_MODEL,
+        });
+
+      case 'openai':
+        return new OpenAIEmbeddingService({
+          apiKey: process.env.OPENAI_API_KEY || '',
+          model: process.env.OPENAI_EMBEDDING_MODEL,
+        });
+
+      case 'default':
+      case 'mock':
+        return new DefaultEmbeddingService();
+
+      default:
+        logger.warn(`EmbeddingServiceFactory: Unknown provider "${provider}", using default`);
+        return new DefaultEmbeddingService();
+    }
   }
 
   /**
@@ -188,5 +295,29 @@ EmbeddingServiceFactory.registerProvider('openai', (config = {}) => {
     apiKey: config.apiKey,
     model: config.model,
     dimensions: config.dimensions,
+  });
+});
+
+EmbeddingServiceFactory.registerProvider('ollama', (config = {}) => {
+  return new OllamaEmbeddingService({
+    baseUrl: config.baseUrl,
+    model: config.model,
+    dimensions: config.dimensions,
+    timeout: config.timeout,
+  });
+});
+
+EmbeddingServiceFactory.registerProvider('openrouter', (config = {}) => {
+  if (!config.apiKey) {
+    throw new Error('API key is required for OpenRouter embedding service');
+  }
+
+  return new OpenRouterEmbeddingService({
+    apiKey: config.apiKey,
+    model: config.model,
+    dimensions: config.dimensions,
+    timeout: config.timeout,
+    siteUrl: config.siteUrl,
+    siteName: config.siteName,
   });
 });
